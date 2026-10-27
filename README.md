@@ -1,2 +1,31 @@
-# clipshare-skills
-Agent skill for ClipShare: move text and files between machines (npx skills add smilealgernon/clipshare-skills -g)
+# ClipShare skills
+
+让 AI 助手用 [ClipShare](https://q3.1o24.com) 在机器之间传文本和文件。
+
+## 安装
+
+把这句话发给你的 AI 助手（Claude Code、Codex、Cursor 等）：
+
+```
+帮我安装 ClipShare skill：npx skills add smilealgernon/clipshare-skills -g
+```
+
+也可以自己在终端里运行 `npx skills add smilealgernon/clipshare-skills -g`。
+
+## 用法
+
+装好以后，直接说：
+
+- “把 dist/app.zip 传上去，给我下载链接”
+- “看一下剪贴板 aB3xQ9 里的报错日志”
+- “下载剪贴板 aB3xQ9 里最新的文件到当前目录”
+
+不登录也能用，文件 1 小时后删除。想读写自己的私有剪贴板、让文件留得更久，在 ClipShare 的「账号设置 → API 令牌」里生成一个，设成环境变量 `CLIPSHARE_TOKEN`。
+
+自己部署的服务器，设 `CLIPSHARE_URL` 指向它。
+
+---
+
+Agent skill for [ClipShare](https://q3.1o24.com): move text and files between machines.
+Install with `npx skills add smilealgernon/clipshare-skills -g`. The skill files live in
+`skills/clipshare`; this repository is generated from the ClipShare source.

@@ -7,19 +7,33 @@
  * Node 20+ only. Uses the legacy-compatible REST API plus the v2 file lifetime call.
  *
  * CLIPSHARE_URL    server, default https://q3.1o24.com
- * CLIPSHARE_TOKEN  optional API token (cs_...), created under 设置 → API 令牌. With it, new
+ * CLIPSHARE_TOKEN  optional API token (cs_...), created under 账号设置 → API 令牌. With it, new
  *                  clipboards belong to that account: files live 1 day instead of 1 hour, can be
- *                  kept longer, and the clipboard can be private.
+ *                  kept longer, and the clipboard can be private. Sites need it.
+ *
+ * Instead of the environment, `clipshare.mjs login` (run by the user in their own terminal)
+ * stores the token in ~/.config/clipshare/config.json, readable only by the user.
  */
 
 import { execFileSync } from 'node:child_process';
 import fs, { openAsBlob } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
-const BASE = (process.env.CLIPSHARE_URL || 'https://q3.1o24.com').replace(/\/+$/, '');
-const TOKEN = process.env.CLIPSHARE_TOKEN || '';
+const CONFIG_FILE = path.join(os.homedir(), '.config', 'clipshare', 'config.json');
+const readConfig = () => {
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+};
+const config = readConfig();
+const BASE = (process.env.CLIPSHARE_URL || config.url || 'https://q3.1o24.com').replace(/\/+$/, '');
+const TOKEN = process.env.CLIPSHARE_TOKEN || config.token || '';
+const TOKEN_SOURCE = process.env.CLIPSHARE_TOKEN ? 'CLIPSHARE_TOKEN' : config.token ? CONFIG_FILE : '';
 const KEEP = ['1h', '1d', '7d', '30d', 'forever'];
 
 const die = message => {
@@ -32,6 +46,8 @@ const usage = () => {
 
 Usage:
   clipshare.mjs whoami
+  clipshare.mjs login                       (the user runs this in their own terminal)
+  clipshare.mjs logout
   clipshare.mjs create [name] [--private]
   clipshare.mjs add-text <clipboard_id> <text>
   clipshare.mjs add-text <clipboard_id> --file <path>
@@ -43,10 +59,14 @@ Usage:
   clipshare.mjs download <file_id> [output_path]
   clipshare.mjs keep <file_id> <1h|1d|7d|30d|forever>
   clipshare.mjs delete-file <file_id>
+  clipshare.mjs sites
+  clipshare.mjs publish <dir|site.zip> [--slug name] [--name title] [--spa] [--password pw]
+  clipshare.mjs update-site <slug> <dir|site.zip>
+  clipshare.mjs delete-site <slug>
 
 Environment:
   CLIPSHARE_URL    default https://q3.1o24.com
-  CLIPSHARE_TOKEN  API token (cs_...); without it everything is anonymous`);
+  CLIPSHARE_TOKEN  API token (cs_...); without it (and without login) everything is anonymous`);
 };
 
 const authHeaders = (extra = {}) => (TOKEN ? { ...extra, Authorization: `Bearer ${TOKEN}` } : extra);
@@ -94,11 +114,112 @@ async function setKeep(fileId, keep) {
   console.log(`Expires: ${file.expires_at || 'never'}`);
 }
 
+
+const requireToken = what =>
+  TOKEN || die(`${what} needs an API token. Ask the user to create one under 账号设置 → API 令牌 at ${BASE}/settings and run "node <this script> login" in their own terminal.`);
+
+// Read one line from the terminal without echoing it.
+function readHidden(prompt) {
+  return new Promise((resolve, reject) => {
+    const input = process.stdin;
+    if (!input.isTTY) return reject(new Error('not a terminal'));
+    process.stdout.write(prompt);
+    input.setRawMode(true);
+    input.resume();
+    input.setEncoding('utf8');
+    let value = '';
+    const done = result => {
+      input.setRawMode(false);
+      input.pause();
+      input.removeListener('data', onData);
+      process.stdout.write('\n');
+      result instanceof Error ? reject(result) : resolve(result);
+    };
+    const onData = chunk => {
+      for (const ch of chunk) {
+        if (ch === '\r' || ch === '\n') return done(value.trim());
+        if (ch === '\u0003') return done(new Error('cancelled'));
+        if (ch === '\u007f' || ch === '\b') value = value.slice(0, -1);
+        else value += ch;
+      }
+    };
+    input.on('data', onData);
+  });
+}
+
+// Files of a site directory, as [relative posix path, absolute path]; skips VCS and dependencies.
+function siteFiles(dir) {
+  const skip = new Set(['.git', 'node_modules', '.DS_Store']);
+  const out = [];
+  const walk = current => {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      if (skip.has(entry.name)) continue;
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile()) out.push([path.relative(dir, full).split(path.sep).join('/'), full]);
+    }
+  };
+  walk(dir);
+  return out;
+}
+
+async function siteForm(source, fields = {}) {
+  if (!source || !fs.existsSync(source)) die(`site source not found: ${source}`);
+  const form = new FormData();
+  for (const [key, value] of Object.entries(fields)) if (value !== undefined) form.append(key, value);
+  if (fs.statSync(source).isDirectory()) {
+    const files = siteFiles(source);
+    if (!files.length) die(`no files in ${source}`);
+    if (!files.some(([rel]) => rel === 'index.html')) console.log('Note: no index.html at the top level.');
+    for (const [rel, full] of files) form.append('files', await openAsBlob(full), rel);
+    console.log(`Files: ${files.length}`);
+  } else {
+    if (!source.toLowerCase().endsWith('.zip')) die('a site is a directory or a .zip file');
+    form.append('file', await openAsBlob(source), path.basename(source));
+  }
+  return form;
+}
+
+const showSite = site => {
+  console.log(`Site: ${site.url}`);
+  console.log(`Version: ${site.version}  Files: ${site.file_count}  Size: ${(site.size / 1024).toFixed(1)} KB`);
+  if (site.has_password) console.log('Password: required');
+};
+
 const commands = {
   async whoami() {
-    if (!TOKEN) return console.log('anonymous (CLIPSHARE_TOKEN not set)');
+    if (!TOKEN) return console.log(`anonymous (no CLIPSHARE_TOKEN, no ${CONFIG_FILE})`);
     const me = await call('GET', '/api/v2/me');
-    console.log(me?.user?.email || JSON.stringify(me));
+    console.log(`${me?.user?.email || JSON.stringify(me)} (token from ${TOKEN_SOURCE})`);
+    const storage = me?.user?.storage;
+    if (storage) {
+      const mb = n => (n / 1024 / 1024).toFixed(1);
+      console.log(`Storage: ${mb(storage.used)} MB of ${storage.quota ? `${mb(storage.quota)} MB` : 'unlimited'}`);
+    }
+  },
+
+  async login() {
+    let token;
+    try {
+      console.log(`Create a token at ${BASE}/settings (账号设置 → API 令牌), then paste it here.`);
+      token = await readHidden('API token (input hidden): ');
+    } catch (err) {
+      die(err.message === 'cancelled' ? 'cancelled' : 'login reads the token from a terminal: run this command yourself, not through an agent');
+    }
+    if (!token.startsWith('cs_')) die('that does not look like a ClipShare token (cs_...)');
+    const response = await fetch(`${BASE}/api/v2/me`, { headers: { Authorization: `Bearer ${token}` } });
+    if (!response.ok) die(`the server did not accept this token (${response.status})`);
+    const me = await response.json();
+    fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ url: BASE, token }, null, 2) + '\n', { mode: 0o600 });
+    fs.chmodSync(CONFIG_FILE, 0o600);
+    console.log(`Logged in as ${me.user.email}. Token saved to ${CONFIG_FILE} (only you can read it).`);
+  },
+
+  async logout() {
+    if (!fs.existsSync(CONFIG_FILE)) return console.log('not logged in');
+    fs.unlinkSync(CONFIG_FILE);
+    console.log(`Removed ${CONFIG_FILE}`);
   },
 
   async create(args) {
@@ -235,6 +356,42 @@ const commands = {
   async 'delete-file'([fileId]) {
     if (!fileId) die('file_id is required');
     show(await call('DELETE', `/api/files/${fileId}`));
+  },
+
+  async sites() {
+    requireToken('Listing sites');
+    const list = await call('GET', '/api/v2/sites');
+    if (!list.sites.length) return console.log('no sites yet');
+    for (const site of list.sites) {
+      const flags = [site.has_password && 'password', site.disabled && 'disabled', site.blocked && 'blocked'].filter(Boolean);
+      console.log(`${site.slug}  ${site.url}  v${site.version}  ${site.name || ''}${flags.length ? `  [${flags.join(', ')}]` : ''}`);
+    }
+  },
+
+  async publish([source, ...rest]) {
+    requireToken('Publishing a site');
+    const fields = {};
+    for (let i = 0; i < rest.length; i++) {
+      if (rest[i] === '--slug') fields.slug = rest[++i];
+      else if (rest[i] === '--name') fields.name = rest[++i];
+      else if (rest[i] === '--password') fields.password = rest[++i];
+      else if (rest[i] === '--spa') fields.spa = 'true';
+      else die(`unknown option: ${rest[i]}`);
+    }
+    showSite(await call('POST', '/api/v2/sites', { body: await siteForm(source, fields) }));
+  },
+
+  async 'update-site'([slug, source]) {
+    requireToken('Updating a site');
+    if (!slug || !source) die('usage: update-site <slug> <dir|site.zip>');
+    showSite(await call('PUT', `/api/v2/sites/${slug}`, { body: await siteForm(source) }));
+  },
+
+  async 'delete-site'([slug]) {
+    requireToken('Deleting a site');
+    if (!slug) die('slug is required');
+    await call('DELETE', `/api/v2/sites/${slug}`);
+    console.log(`Deleted site ${slug}`);
   },
 
   async help() {

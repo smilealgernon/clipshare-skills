@@ -7,7 +7,7 @@
 把这句话发给你的 AI 助手（Claude Code、Codex、Cursor 等）：
 
 ```
-帮我安装 ClipShare skill：npx skills add smilealgernon/clipshare-skills -g
+帮我安装 ClipShare skill：npx skills add smilealgernon/clipshare-skills -g，装好后带我配置 API 令牌
 ```
 
 也可以自己在终端里运行 `npx skills add smilealgernon/clipshare-skills -g`。
@@ -19,8 +19,9 @@
 - “把 dist/app.zip 传上去，给我下载链接”
 - “看一下剪贴板 aB3xQ9 里的报错日志”
 - “下载剪贴板 aB3xQ9 里最新的文件到当前目录”
+- “把 dist 目录发布成网站，地址用 my-demo”
 
-不登录也能用，文件 1 小时后删除。想读写自己的私有剪贴板、让文件留得更久，在 ClipShare 的「账号设置 → API 令牌」里生成一个，设成环境变量 `CLIPSHARE_TOKEN`。
+不配置令牌也能用，文件 1 小时后删除。想读写自己的私有剪贴板、让文件留得更久、发布网站，就在 ClipShare 的「账号设置 → API 令牌」里生成一个令牌，然后在自己的终端里运行 `node ~/.agents/skills/clipshare/scripts/clipshare.mjs login`，把令牌粘贴进去（AI 助手会告诉你这台电脑上的准确路径）。也可以设成环境变量 `CLIPSHARE_TOKEN`。
 
 自己部署的服务器，设 `CLIPSHARE_URL` 指向它。
 

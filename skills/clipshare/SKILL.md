@@ -29,6 +29,30 @@ Never ask the user to paste a token into the chat. Ask them to put it in the
 environment (`CLIPSHARE_TOKEN`) or the MCP client config themselves. Do not
 write a token into a repository file.
 
+## Right after installing: the API token
+
+Without a token everything works anonymously: files go after 1 hour, nothing
+is private, and sites cannot be published. When the skill has just been
+installed, or the user wants private clipboards, longer-lived files or a site,
+run `node $H whoami` (see Helper script for `$H`). If it says `anonymous`,
+walk the user through these steps, in the user's language, and wait for them:
+
+1. Open `https://q3.1o24.com/settings` (log in or register first), find
+   「API 令牌」, type a name such as the machine's name, click 生成, and copy
+   the `cs_...` token. It is shown once.
+2. In **their own terminal window** (not through you: the token must not
+   enter this conversation), run the login command with the full path of
+   the helper filled in, for example:
+   `node ~/.agents/skills/clipshare/scripts/clipshare.mjs login`
+   and paste the token at the hidden prompt. It is checked against the server
+   and saved to `~/.config/clipshare/config.json`, readable only by them.
+3. Tell you when it is done; run `node $H whoami` again to confirm the account.
+
+Print the exact login command for this machine (resolve `$H` first). In Claude
+Code, a `!` command cannot read hidden input, so it has to be a separate
+terminal. Setting `CLIPSHARE_TOKEN` in their shell profile works too;
+`node $H logout` removes the saved token.
+
 ## MCP
 
 Streamable HTTP, stateless, at `https://q3.1o24.com/mcp`. No token: works on
@@ -88,6 +112,8 @@ node $H download FILE_ID [output_path]          # streamed; never overwrites
 node $H keep FILE_ID forever                    # owner only (needs the token)
 node $H delete-file FILE_ID                     # ask first
 node $H pack ./logs /tmp/logs.tar.gz            # directories must be packed first
+node $H login                                   # the user runs this in their own terminal
+node $H logout
 ```
 
 `CLIPSHARE_TOKEN` turns on the account features; `CLIPSHARE_URL` points it at
@@ -99,6 +125,29 @@ name and, when that name exists, saves next to it with a timestamp.
 anonymous files always live 1 hour.
 
 Write archives to a scratch directory, never into a worktree.
+
+## Sites
+
+A site is a folder of static files (`index.html` at the top) served at
+`https://<slug>.1o24.page`. Publishing needs the token (see above) and a
+verified email; each account has a storage limit (default 1 GB) that files
+and sites share.
+
+```bash
+node $H sites                                          # slug, URL, version
+node $H publish ./dist --slug my-demo --name "Demo"    # a folder or a .zip
+node $H publish ./dist --spa                           # unknown paths serve index.html
+node $H publish ./dist --password secret123            # visitors need the password
+node $H update-site my-demo ./dist                     # new version, same URL
+node $H delete-site my-demo                            # ask first
+```
+
+Publish the build output (`dist/`, `build/`, `out/`), not the source tree;
+`.git` and `node_modules` are skipped. Without `--slug` the server picks a
+random one. Publishing puts the folder on the public internet: check what is
+in it first (no `.env`, keys or private data) and say what will go up. The
+last three versions are kept and can be restored on the site's page
+(`/sites`).
 
 ## Plain HTTP
 

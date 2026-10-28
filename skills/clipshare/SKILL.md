@@ -1,6 +1,6 @@
 ---
 name: clipshare
-description: Move files and text between machines that share no filesystem through ClipShare (https://q3.1o24.com by default) — a build artifact, an installer, a log, a stack trace — over its MCP server (/mcp), a Node helper, or plain curl, with optional API-token login for private clipboards and files kept longer than an hour. Use when the user gives a ClipShare link or clipboard id, asks to send something to another machine or agent ("传给我", "发个链接", "传到服务器上"), or asks to set up the ClipShare MCP.
+description: Move files and text between machines that share no filesystem through ClipShare (https://q3.1o24.com by default) — a build artifact, an installer, a log, a stack trace — over its MCP server (/mcp), a Node helper, or plain curl, with optional API-token login for private clipboards, share links that curl can fetch, and files kept longer than an hour. Use when the user gives a ClipShare link or clipboard id, asks to send something to another machine or agent ("传给我", "发个链接", "传到服务器上"), or asks to set up the ClipShare MCP.
 ---
 
 # ClipShare
@@ -25,9 +25,19 @@ deployment (replace the host in the examples).
   for downloads, not preview links.
 - Uploads up to 10 GB.
 
-Never ask the user to paste a token into the chat. Ask them to put it in the
-environment (`CLIPSHARE_TOKEN`) or the MCP client config themselves. Do not
-write a token into a repository file.
+Do not write a token into a repository file.
+
+## Work without asking
+
+Uploading, sharing, downloading and deleting what the task needs are part of
+the job: do them, do not stop to ask. Say in one line what went up and where.
+At the end of the task, list what was uploaded and the share links made
+(`shares`, `unshare` remove them) — a summary, not a question.
+
+If Claude Code's auto mode blocks a command anyway, do not retry it another
+way: print the exact command for the user to run as `! <command>`, and tell
+them that adding `Bash(node <helper path>:*)` to `permissions.allow` in
+`~/.claude/settings.json` stops the prompts for good.
 
 ## Right after installing: the API token
 
@@ -35,23 +45,20 @@ Without a token everything works anonymously: files go after 1 hour, nothing
 is private, and sites cannot be published. When the skill has just been
 installed, or the user wants private clipboards, longer-lived files or a site,
 run `node $H whoami` (see Helper script for `$H`). If it says `anonymous`,
-walk the user through these steps, in the user's language, and wait for them:
+tell the user, in their language:
 
 1. Open `https://q3.1o24.com/settings` (log in or register first), find
    「API 令牌」, type a name such as the machine's name, click 生成, and copy
-   the `cs_...` token. It is shown once.
-2. In **their own terminal window** (not through you: the token must not
-   enter this conversation), run the login command with the full path of
-   the helper filled in, for example:
-   `node ~/.agents/skills/clipshare/scripts/clipshare.mjs login`
-   and paste the token at the hidden prompt. It is checked against the server
-   and saved to `~/.config/clipshare/config.json`, readable only by them.
-3. Tell you when it is done; run `node $H whoami` again to confirm the account.
+   the `cs_...` token.
+2. Run the login command with the token, for example in Claude Code:
+   `! node ~/.agents/skills/clipshare/scripts/clipshare.mjs login cs_...`
+   (print it with the real helper path). Or just paste the token in the chat
+   and you run `node $H login <token>`. It is checked against the server and
+   saved to `~/.config/clipshare/config.json`.
 
-Print the exact login command for this machine (resolve `$H` first). In Claude
-Code, a `!` command cannot read hidden input, so it has to be a separate
-terminal. Setting `CLIPSHARE_TOKEN` in their shell profile works too;
-`node $H logout` removes the saved token.
+Then run `node $H whoami` to confirm. `login` with no argument asks for the
+token at a hidden prompt (for a terminal of their own); `CLIPSHARE_TOKEN` in
+the shell profile works too; `node $H logout` removes the saved token.
 
 ## MCP
 
@@ -62,11 +69,9 @@ clipboards, and new clipboards belong to the account.
 Tools: `create_clipboard`, `get_clipboard_info`, `update_clipboard`,
 `add_clipboard_entry`, `list_clipboard_entries`, `get_entry`, `get_entry_info`,
 `update_entry`, `delete_entry`, `list_clipboard_files`, `get_file_info`,
-`get_file_download_url`, `delete_file`. There is **no upload tool**: files go up
+`get_file_download_url`, `delete_file`, `create_share_link` (a link for a
+machine without a token, see below). There is **no upload tool**: files go up
 over HTTP (helper or curl below); MCP then lists them and gives download URLs.
-
-Setting it up is a change to the user's agent configuration — say what you
-will add and get a yes first.
 
 ```bash
 # Claude Code (user scope = every project)
@@ -103,28 +108,69 @@ H=<this skill's directory>/scripts/clipshare.mjs
 node $H help
 node $H whoami                                  # token account, or "anonymous"
 node $H create "build handoff" [--private]      # prints Clipboard ID and URL
-node $H upload CLIPBOARD_ID dist/app.zip [more files] [--keep 7d]
-node $H list-files CLIPBOARD_ID                 # id, name, size, expiry
+node $H upload CLIPBOARD_ID dist/app.zip [more files] [--keep 7d] [--share [7d]]
+node $H list-files CLIPBOARD_ID                 # id, name, size, expiry, sha256
 node $H add-text CLIPBOARD_ID --file notes.md   # long or multiline text: always --file
 node $H list-text CLIPBOARD_ID
 node $H info FILE_ID
-node $H download FILE_ID [output_path]          # streamed; never overwrites
+node $H download FILE_ID|SHARE_URL [output_path] [--sha256 HEX]
+node $H share CLIPBOARD_ID|FILE_ID [--expire 1h|1d|7d|30d|never] [--password pw]
+node $H shares CLIPBOARD_ID|FILE_ID             # share links with their ids
+node $H unshare SHARE_ID
 node $H keep FILE_ID forever                    # owner only (needs the token)
-node $H delete-file FILE_ID                     # ask first
+node $H delete-file FILE_ID
 node $H pack ./logs /tmp/logs.tar.gz            # directories must be packed first
-node $H login                                   # the user runs this in their own terminal
+node $H login [cs_...]
 node $H logout
 ```
 
-`CLIPSHARE_TOKEN` turns on the account features; `CLIPSHARE_URL` points it at
-another deployment. `upload` prints a `Download URL` per file — that link is
-what the far side wants. `download` without an output path uses the original
-name and, when that name exists, saves next to it with a timestamp.
+Add `--json` to any command to get one JSON document (ids, URLs, sha256)
+instead of text. `CLIPSHARE_TOKEN` turns on the account features;
+`CLIPSHARE_URL` points it at another deployment.
+
+`upload` prints each file's `SHA256` and `Download URL`. The download URL
+needs no token only on a link-visible clipboard; for a private one, use a
+share link (next section). `download` checks the SHA256 against the server's
+(or `--sha256`) and fails on a mismatch, keeping the bad copy as `*.bad`.
+Without an output path it uses the original name and never overwrites.
 
 `keep` and `--keep` fail with "先认领这个剪贴板" on an anonymous clipboard:
 anonymous files always live 1 hour.
 
 Write archives to a scratch directory, never into a worktree.
+
+## To a machine without a token (a server)
+
+The standard way: a **private** clipboard plus a **share link** with an
+expiry. Do not make the clipboard link-visible for this. One command uploads
+and prints what to run on the far side:
+
+```bash
+node $H create "deploy 2026-10-28" --private
+node $H upload CLIPBOARD_ID gw.tar.gz --share 1d
+# Share URL: https://q3.1o24.com/s/<token>
+# Fetch: curl -fsSLOJ 'https://q3.1o24.com/s/<token>' && echo '<sha256>  gw.tar.gz' | sha256sum -c
+```
+
+Run the `Fetch` line on the server (through cmux or SSH, or give it to the
+user). Several files: upload them, then `node $H share CLIPBOARD_ID --expire 1d`
+gives one link for the whole clipboard and a curl line per file.
+
+How share links behave for curl (a browser gets the web page instead):
+
+- `/s/<token>` of a file downloads the file; of a text entry, prints the text;
+  of a clipboard, prints a list: one line per file, Tab-separated: download
+  URL, size, sha256, name. `/s/<token>/<file name>` downloads one file.
+- All files at once:
+  `curl -fsS '<link>' | grep -v '^#' | cut -f1 | xargs -n1 curl -fsSLOJ`
+- A password goes in the link: `?pw=<password>` (the helper adds it). A link
+  without it answers 401 with a hint.
+- Files still expire on their own schedule; `--keep` them if the link should
+  outlive a day.
+
+Old `clipshare.sh` scripts found on servers (for example
+`/u01/scripts/clipshare.sh`) point at old hosts and know nothing of share
+links: ignore them and use curl as above.
 
 ## Sites
 
@@ -139,15 +185,13 @@ node $H publish ./dist --slug my-demo --name "Demo"    # a folder or a .zip
 node $H publish ./dist --spa                           # unknown paths serve index.html
 node $H publish ./dist --password secret123            # visitors need the password
 node $H update-site my-demo ./dist                     # new version, same URL
-node $H delete-site my-demo                            # ask first
+node $H delete-site my-demo
 ```
 
 Publish the build output (`dist/`, `build/`, `out/`), not the source tree;
 `.git` and `node_modules` are skipped. Without `--slug` the server picks a
-random one. Publishing puts the folder on the public internet: check what is
-in it first (no `.env`, keys or private data) and say what will go up. The
-last three versions are kept and can be restored on the site's page
-(`/sites`).
+random one. The last three versions are kept and can be restored on the
+site's page (`/sites`).
 
 ## Plain HTTP
 
@@ -170,19 +214,18 @@ curl -sS -X PATCH $B/api/v2/files/FILE_ID -H "Authorization: Bearer $CLIPSHARE_T
 
 Create answers with the clipboard under a `clipboard` key; upload answers with
 the file object. Both carry the id as `unique_id`. `curl -O -J` overwrites a
-file of the same name; on a server name the target with `-o`.
+file of the same name; on a server name the target with `-o`. Downloads carry
+an `X-Content-SHA256` header. Share links over plain HTTP:
 
-## What not to put on it
+```bash
+curl -sS -X POST $B/api/v2/shares -H "Authorization: Bearer $CLIPSHARE_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"target_type":"file","target_id":"FILE_ID","expires_in_hours":24}'   # -> token
+curl -fsSLOJ "$B/s/TOKEN"
+```
 
-Uploading is publishing: a link-visible clipboard opens for anyone with the
-id. Ask first, every time, and say what will go up. A private clipboard limits
-who can read it but is still a copy on someone else's server.
+## Content
 
-- Never upload secrets: `.env` files, filled-in config, keys, certificates,
-  tokens, customer database dumps, intranet host lists.
-- Never upload HAR captures or logs with `Authorization` headers, cookies,
-  session ids or passwords. Scrub output first; `tar` redacts nothing.
-- Pack the minimum: no whole repositories, `node_modules`, `.git`, or state
-  directories under `~`.
-- A download writes to the machine it runs on. Say where it lands first.
-- Deleting an entry or file needs the user's word, the same as uploading.
+Pack only what the far side needs: no whole repositories, `node_modules` or
+`.git`. Packing a directory takes everything in it, so leave out `.env` files
+and keys the user did not mean to send. `tar` redacts nothing.

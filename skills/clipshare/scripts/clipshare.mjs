@@ -11,11 +11,14 @@
  *                  clipboards belong to that account: files live 1 day instead of 1 hour, can be
  *                  kept longer, and the clipboard can be private. Sites need it.
  *
- * Instead of the environment, `clipshare.mjs login` (run by the user in their own terminal)
- * stores the token in ~/.config/clipshare/config.json, readable only by the user.
+ * Instead of the environment, `clipshare.mjs login [token]` stores the token in
+ * ~/.config/clipshare/config.json, readable only by the user.
+ *
+ * --json (anywhere on the command line) prints one JSON document instead of text.
  */
 
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs, { openAsBlob } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -35,6 +38,8 @@ const BASE = (process.env.CLIPSHARE_URL || config.url || 'https://q3.1o24.com').
 const TOKEN = process.env.CLIPSHARE_TOKEN || config.token || '';
 const TOKEN_SOURCE = process.env.CLIPSHARE_TOKEN ? 'CLIPSHARE_TOKEN' : config.token ? CONFIG_FILE : '';
 const KEEP = ['1h', '1d', '7d', '30d', 'forever'];
+const EXPIRE_HOURS = { '1h': 1, '1d': 24, '7d': 168, '30d': 720, never: null };
+const JSON_OUT = process.argv.includes('--json');
 
 const die = message => {
   console.error(`ERROR: ${message}`);
@@ -46,23 +51,28 @@ const usage = () => {
 
 Usage:
   clipshare.mjs whoami
-  clipshare.mjs login                       (the user runs this in their own terminal)
+  clipshare.mjs login [token]               (no token: asks for it, hidden)
   clipshare.mjs logout
   clipshare.mjs create [name] [--private]
   clipshare.mjs add-text <clipboard_id> <text>
   clipshare.mjs add-text <clipboard_id> --file <path>
   clipshare.mjs list-text <clipboard_id>
   clipshare.mjs pack <source_path> [output.tar.gz]
-  clipshare.mjs upload <clipboard_id> <file_path> [more_files...] [--keep 1h|1d|7d|30d|forever]
+  clipshare.mjs upload <clipboard_id> <file_path> [more_files...] [--keep 1h|1d|7d|30d|forever] [--share [expire]]
   clipshare.mjs list-files <clipboard_id>
   clipshare.mjs info <file_id>
-  clipshare.mjs download <file_id> [output_path]
+  clipshare.mjs download <file_id|share_url> [output_path] [--sha256 hex]
+  clipshare.mjs share <clipboard_id|file_id> [--expire 1h|1d|7d|30d|never] [--password pw]
+  clipshare.mjs shares <clipboard_id|file_id>
+  clipshare.mjs unshare <share_id>
   clipshare.mjs keep <file_id> <1h|1d|7d|30d|forever>
   clipshare.mjs delete-file <file_id>
   clipshare.mjs sites
   clipshare.mjs publish <dir|site.zip> [--slug name] [--name title] [--spa] [--password pw]
   clipshare.mjs update-site <slug> <dir|site.zip>
   clipshare.mjs delete-site <slug>
+
+Add --json to any command for JSON output.
 
 Environment:
   CLIPSHARE_URL    default https://q3.1o24.com
@@ -111,7 +121,38 @@ const stamp = () => new Date().toISOString().replace(/[-:]/g, '').replace(/\..*/
 async function setKeep(fileId, keep) {
   if (!KEEP.includes(keep)) die(`keep must be one of ${KEEP.join(', ')}`);
   const file = await call('PATCH', `/api/v2/files/${fileId}`, { json: { keep } });
-  console.log(`Expires: ${file.expires_at || 'never'}`);
+  say(`Expires: ${file.expires_at || 'never'}`);
+  return file.expires_at || null;
+}
+
+// Text output; --json prints the result object of each command instead.
+const say = line => JSON_OUT || console.log(line);
+const result = data => JSON_OUT && console.log(JSON.stringify(data, null, 2));
+
+async function sha256File(file) {
+  const hash = createHash('sha256');
+  await pipeline(fs.createReadStream(file), hash);
+  return hash.digest('hex');
+}
+
+// A share link that opens with one request: the password goes in the link.
+const shareUrl = (token, password) => `${BASE}/s/${token}${password ? `?pw=${encodeURIComponent(password)}` : ''}`;
+
+// "clipboard" or "file": ids look alike, so ask the server.
+async function targetType(id) {
+  const headers = authHeaders();
+  if ((await fetch(`${BASE}/api/v2/clipboards/${id}`, { headers })).ok) return 'clipboard';
+  if ((await fetch(`${BASE}/api/files/${id}/info`, { headers })).ok) return 'file';
+  die(`no clipboard or file ${id} (or it is not yours)`);
+}
+
+async function createShare(type, id, expire, password) {
+  requireToken('Sharing');
+  if (!(expire in EXPIRE_HOURS)) die(`--expire must be one of ${Object.keys(EXPIRE_HOURS).join(', ')}`);
+  const share = await call('POST', '/api/v2/shares', {
+    json: { target_type: type, target_id: id, expires_in_hours: EXPIRE_HOURS[expire], password: password || null },
+  });
+  return { id: share.id, url: shareUrl(share.token, password), expires_at: share.expires_at };
 }
 
 
@@ -198,13 +239,16 @@ const commands = {
     }
   },
 
-  async login() {
-    let token;
-    try {
-      console.log(`Create a token at ${BASE}/settings (账号设置 → API 令牌), then paste it here.`);
-      token = await readHidden('API token (input hidden): ');
-    } catch (err) {
-      die(err.message === 'cancelled' ? 'cancelled' : 'login reads the token from a terminal: run this command yourself, not through an agent');
+  async login([given]) {
+    let token = given?.trim();
+    if (!token && !process.stdin.isTTY) token = fs.readFileSync(0, 'utf8').trim();
+    if (!token) {
+      try {
+        console.log(`Create a token at ${BASE}/settings (账号设置 → API 令牌), then paste it here.`);
+        token = await readHidden('API token (input hidden): ');
+      } catch (err) {
+        die(err.message === 'cancelled' ? 'cancelled' : 'no token: pass it as "login cs_..." or pipe it in');
+      }
     }
     if (!token.startsWith('cs_')) die('that does not look like a ClipShare token (cs_...)');
     const response = await fetch(`${BASE}/api/v2/me`, { headers: { Authorization: `Bearer ${token}` } });
@@ -232,9 +276,10 @@ const commands = {
       show(payload);
       die('could not extract clipboard id');
     }
-    console.log(`Clipboard ID: ${id}`);
-    console.log(`Clipboard URL: ${BASE}/${id}`);
-    console.log(`Owner: ${TOKEN ? 'token account' : 'anonymous (files live 1 hour)'}`);
+    say(`Clipboard ID: ${id}`);
+    say(`Clipboard URL: ${BASE}/${id}`);
+    say(`Owner: ${TOKEN ? 'token account' : 'anonymous (files live 1 hour)'}`);
+    result({ id, url: `${BASE}/${id}`, private: priv, anonymous: !TOKEN });
   },
 
   async 'add-text'([clipboardId, ...rest]) {
@@ -249,8 +294,9 @@ const commands = {
       content = rest.join(' ');
     }
     const entry = await call('POST', `/api/clipboards/${clipboardId}/entries`, { json: { content } });
-    console.log(`Entry ID: ${idOf(entry)}`);
-    console.log(`Clipboard URL: ${BASE}/${clipboardId}`);
+    say(`Entry ID: ${idOf(entry)}`);
+    say(`Clipboard URL: ${BASE}/${clipboardId}`);
+    result({ id: idOf(entry), clipboard_url: `${BASE}/${clipboardId}` });
   },
 
   async 'list-text'([clipboardId]) {
@@ -278,9 +324,11 @@ const commands = {
   async upload([clipboardId, ...rest]) {
     if (!clipboardId) die('clipboard_id is required');
     let keep = '';
+    let share = '';
     const files = [];
     for (let i = 0; i < rest.length; i++) {
       if (rest[i] === '--keep') keep = rest[++i] || '';
+      else if (rest[i] === '--share') share = rest[i + 1] in EXPIRE_HOURS ? rest[++i] : '7d';
       else files.push(rest[i]);
     }
     if (!files.length) die('at least one file path is required');
@@ -288,8 +336,10 @@ const commands = {
     for (const file of files) {
       if (!fs.existsSync(file) || !fs.statSync(file).isFile()) die(`file not found: ${file}`);
     }
+    const uploaded = [];
     for (const file of files) {
-      console.log(`Uploading: ${file}`);
+      say(`Uploading: ${file}`);
+      const sha256 = await sha256File(file);
       const form = new FormData();
       form.append('file', await openAsBlob(file), path.basename(file));
       const payload = await call('POST', `/api/clipboards/${clipboardId}/files`, { body: form });
@@ -298,11 +348,20 @@ const commands = {
         show(payload);
         die('could not extract file id');
       }
-      console.log(`File ID: ${id}`);
-      console.log(`Download URL: ${BASE}/api/files/${id}`);
-      if (keep) await setKeep(id, keep);
+      const item = { id, name: path.basename(file), sha256, download_url: `${BASE}/api/files/${id}` };
+      say(`File ID: ${id}`);
+      say(`SHA256: ${sha256}`);
+      say(`Download URL: ${item.download_url}`);
+      if (keep) item.expires_at = await setKeep(id, keep);
+      if (share) {
+        item.share = await createShare('file', id, share);
+        say(`Share URL: ${item.share.url}  (no token needed, ${share === 'never' ? 'no expiry' : `expires in ${share}`})`);
+        say(`Fetch: curl -fsSLOJ '${item.share.url}' && echo '${sha256}  ${item.name}' | sha256sum -c`);
+      }
+      uploaded.push(item);
     }
-    console.log(`Clipboard URL: ${BASE}/${clipboardId}`);
+    say(`Clipboard URL: ${BASE}/${clipboardId}`);
+    result({ clipboard_id: clipboardId, files: uploaded });
   },
 
   async 'list-files'([clipboardId]) {
@@ -310,8 +369,9 @@ const commands = {
     // The v2 view adds expires_at to each file.
     const clipboard = await call('GET', `/api/v2/clipboards/${clipboardId}`);
     for (const f of clipboard.files || []) {
-      console.log(`${f.unique_id}  ${f.filename}  ${f.file_size} bytes  expires ${f.expires_at || 'never'}`);
+      say(`${f.unique_id}  ${f.filename}  ${f.file_size} bytes  expires ${f.expires_at || 'never'}  sha256 ${f.sha256 || '-'}`);
     }
+    result(clipboard.files || []);
   },
 
   async info([fileId]) {
@@ -319,21 +379,31 @@ const commands = {
     show(await call('GET', `/api/files/${fileId}/info`));
   },
 
-  async download([fileId, output]) {
-    if (!fileId) die('file_id is required');
-    let name = '';
-    if (!output) {
-      const info = await call('GET', `/api/files/${fileId}/info`);
-      if (info && typeof info === 'object' && info.filename) name = path.basename(String(info.filename));
+  async download(args) {
+    let expected = '';
+    const positional = [];
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === '--sha256') expected = (args[++i] || '').toLowerCase();
+      else positional.push(args[i]);
     }
-    const url = `${BASE}/api/files/${fileId}`;
+    const [source, output] = positional;
+    if (!source) die('file_id or share URL is required');
+    // A share link (/s/<token>...) or any full URL is fetched as is; a bare id is a file id.
+    const isUrl = /^https?:\/\//.test(source);
+    const url = isUrl ? source : `${BASE}/api/files/${source}`;
     let response;
     try {
-      response = await fetch(url, { headers: authHeaders(), redirect: 'follow' });
+      response = await fetch(url, { headers: isUrl ? {} : authHeaders(), redirect: 'follow' });
     } catch (err) {
       die(`GET ${url}\n${err.message}`);
     }
-    if (!response.ok || !response.body) die(`GET ${url} -> ${response.status}`);
+    if (!response.ok || !response.body) die(`GET ${url} -> ${response.status}\n${(await response.text()).slice(0, 500)}`);
+    const disposition = response.headers.get('content-disposition') || '';
+    if (!disposition.startsWith('attachment')) die(`${url} is not a file. It says:\n${(await response.text()).slice(0, 2000)}`);
+    const star = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
+    const plain = /filename="?([^";]+)"?/i.exec(disposition);
+    const name = path.basename(star ? decodeURIComponent(star[1]) : plain ? plain[1] : '');
+    const fileId = isUrl ? 'download' : source;
 
     // Never overwrite: keep the existing file and save the new one with a timestamp.
     let target = output || name || `clipshare-${fileId}`;
@@ -343,9 +413,81 @@ const commands = {
       console.log('Exists already, saving alongside it instead.');
     }
     // Streamed to disk: files can be several GB.
-    await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(target));
-    console.log(`Saved: ${target}`);
-    console.log(`Size: ${(fs.statSync(target).size / 1024 / 1024).toFixed(2)} MB`);
+    const hash = createHash('sha256');
+    await pipeline(
+      Readable.fromWeb(response.body),
+      async function* (chunks) {
+        for await (const chunk of chunks) {
+          hash.update(chunk);
+          yield chunk;
+        }
+      },
+      fs.createWriteStream(target),
+    );
+    const sha256 = hash.digest('hex');
+    // Check against what the caller expects, else against what the server stored.
+    const want = expected || response.headers.get('x-content-sha256') || '';
+    if (want && want !== sha256) {
+      fs.renameSync(target, `${target}.bad`);
+      die(`SHA256 mismatch: got ${sha256}, expected ${want}. Kept the download as ${target}.bad`);
+    }
+    say(`Saved: ${target}`);
+    say(`Size: ${(fs.statSync(target).size / 1024 / 1024).toFixed(2)} MB`);
+    say(`SHA256: ${sha256}${want ? ' (verified)' : ''}`);
+    result({ path: target, size: fs.statSync(target).size, sha256, verified: Boolean(want) });
+  },
+
+  async share([id, ...rest]) {
+    if (!id) die('usage: share <clipboard_id|file_id> [--expire 1h|1d|7d|30d|never] [--password pw]');
+    let expire = '7d';
+    let password = '';
+    for (let i = 0; i < rest.length; i++) {
+      if (rest[i] === '--expire') expire = rest[++i];
+      else if (rest[i] === '--password') password = rest[++i];
+      else die(`unknown option: ${rest[i]}`);
+    }
+    requireToken('Sharing');
+    const type = await targetType(id);
+    const share = await createShare(type, id, expire, password);
+    const out = { ...share, target_type: type, target_id: id };
+    say(`Share URL: ${share.url}`);
+    say(`Share ID: ${share.id}  Expires: ${share.expires_at || 'never'}`);
+    if (type === 'clipboard') {
+      // The link lists the clipboard's files for curl, one download URL per line.
+      const listing = await (await fetch(share.url)).text();
+      out.files = listing
+        .split('\n')
+        .filter(line => line && !line.startsWith('#'))
+        .map(line => {
+          const [url, size, sha256, name] = line.split('\t');
+          return { name, size: Number(size), sha256: sha256 === '-' ? null : sha256, url };
+        });
+      for (const f of out.files) say(`  ${f.name}: curl -fsSLOJ '${f.url}'`);
+      say(`All files: curl -fsS '${share.url}' | grep -v '^#' | cut -f1 | xargs -n1 curl -fsSLOJ`);
+    } else {
+      say(`Fetch: curl -fsSLOJ '${share.url}'`);
+    }
+    result(out);
+  },
+
+  async shares([id]) {
+    if (!id) die('usage: shares <clipboard_id|file_id>');
+    requireToken('Listing shares');
+    const type = await targetType(id);
+    const list = await call('GET', `/api/v2/shares?target_type=${type}&target_id=${id}`);
+    for (const s of list) {
+      say(`${s.id}  ${shareUrl(s.token)}  ${s.active ? 'active' : 'inactive'}  expires ${s.expires_at || 'never'}${s.has_password ? '  password' : ''}  opened ${s.view_count}x`);
+    }
+    if (!list.length) say('no share links');
+    result(list);
+  },
+
+  async unshare([shareId]) {
+    if (!shareId) die('usage: unshare <share_id>');
+    requireToken('Revoking a share');
+    await call('DELETE', `/api/v2/shares/${shareId}`);
+    say(`Revoked share ${shareId}`);
+    result({ revoked: Number(shareId) });
   },
 
   async keep([fileId, keep]) {
@@ -399,7 +541,7 @@ const commands = {
   },
 };
 
-const [command = 'help', ...args] = process.argv.slice(2);
+const [command = 'help', ...args] = process.argv.slice(2).filter(a => a !== '--json');
 const run = commands[command] || (['--help', '-h'].includes(command) ? commands.help : null);
 if (!run) {
   usage();

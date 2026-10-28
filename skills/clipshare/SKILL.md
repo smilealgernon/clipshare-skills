@@ -115,10 +115,11 @@ node $H list-text CLIPBOARD_ID
 node $H info FILE_ID
 node $H download FILE_ID|SHARE_URL [output_path] [--sha256 HEX]
 node $H share CLIPBOARD_ID|FILE_ID [--expire 1h|1d|7d|30d|never] [--password pw]
-node $H shares CLIPBOARD_ID|FILE_ID             # share links with their ids
+node $H shares CLIPBOARD_ID|FILE_ID             # share links with their ids (a clipboard's include its files')
 node $H unshare SHARE_ID
 node $H keep FILE_ID forever                    # owner only (needs the token)
 node $H delete-file FILE_ID
+node $H delete-clipboard CLIPBOARD_ID           # with its text and files
 node $H pack ./logs /tmp/logs.tar.gz            # directories must be packed first
 node $H login [cs_...]
 node $H logout

@@ -67,6 +67,7 @@ Usage:
   clipshare.mjs unshare <share_id>
   clipshare.mjs keep <file_id> <1h|1d|7d|30d|forever>
   clipshare.mjs delete-file <file_id>
+  clipshare.mjs delete-clipboard <clipboard_id>  (its text and files too)
   clipshare.mjs sites
   clipshare.mjs publish <dir|site.zip> [--slug name] [--name title] [--spa] [--password pw]
   clipshare.mjs update-site <slug> <dir|site.zip>
@@ -116,7 +117,8 @@ const idOf = payload => {
 };
 
 const show = payload => console.log(typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2));
-const stamp = () => new Date().toISOString().replace(/[-:]/g, '').replace(/\..*/, '').replace('T', '-');
+// UTC, marked with Z so nobody reads it as local time: 20261028-032403Z.
+const stamp = () => new Date().toISOString().replace(/[-:]/g, '').replace(/\..*/, 'Z').replace('T', '-');
 
 async function setKeep(fileId, keep) {
   if (!KEEP.includes(keep)) die(`keep must be one of ${KEEP.join(', ')}`);
@@ -211,9 +213,9 @@ async function siteForm(source, fields = {}) {
   if (fs.statSync(source).isDirectory()) {
     const files = siteFiles(source);
     if (!files.length) die(`no files in ${source}`);
-    if (!files.some(([rel]) => rel === 'index.html')) console.log('Note: no index.html at the top level.');
+    if (!files.some(([rel]) => rel === 'index.html')) say('Note: no index.html at the top level.');
     for (const [rel, full] of files) form.append('files', await openAsBlob(full), rel);
-    console.log(`Files: ${files.length}`);
+    say(`Files: ${files.length}`);
   } else {
     if (!source.toLowerCase().endsWith('.zip')) die('a site is a directory or a .zip file');
     form.append('file', await openAsBlob(source), path.basename(source));
@@ -222,21 +224,26 @@ async function siteForm(source, fields = {}) {
 }
 
 const showSite = site => {
-  console.log(`Site: ${site.url}`);
-  console.log(`Version: ${site.version}  Files: ${site.file_count}  Size: ${(site.size / 1024).toFixed(1)} KB`);
-  if (site.has_password) console.log('Password: required');
+  say(`Site: ${site.url}`);
+  say(`Version: ${site.version}  Files: ${site.file_count}  Size: ${(site.size / 1024).toFixed(1)} KB`);
+  if (site.has_password) say('Password: required');
+  result(site);
 };
 
 const commands = {
   async whoami() {
-    if (!TOKEN) return console.log(`anonymous (no CLIPSHARE_TOKEN, no ${CONFIG_FILE})`);
+    if (!TOKEN) {
+      say(`anonymous (no CLIPSHARE_TOKEN, no ${CONFIG_FILE})`);
+      return result({ anonymous: true });
+    }
     const me = await call('GET', '/api/v2/me');
-    console.log(`${me?.user?.email || JSON.stringify(me)} (token from ${TOKEN_SOURCE})`);
+    say(`${me?.user?.email || JSON.stringify(me)} (token from ${TOKEN_SOURCE})`);
     const storage = me?.user?.storage;
     if (storage) {
       const mb = n => (n / 1024 / 1024).toFixed(1);
-      console.log(`Storage: ${mb(storage.used)} MB of ${storage.quota ? `${mb(storage.quota)} MB` : 'unlimited'}`);
+      say(`Storage: ${mb(storage.used)} MB of ${storage.quota ? `${mb(storage.quota)} MB` : 'unlimited'}`);
     }
+    result({ anonymous: false, email: me?.user?.email, token_source: TOKEN_SOURCE, storage: storage || null });
   },
 
   async login([given]) {
@@ -317,8 +324,10 @@ const commands = {
     } catch (err) {
       die(`tar failed: ${err.message}`);
     }
-    console.log(`Archive: ${archive}`);
-    console.log(`Size: ${(fs.statSync(archive).size / 1024 / 1024).toFixed(2)} MB`);
+    const size = fs.statSync(archive).size;
+    say(`Archive: ${archive}`);
+    say(`Size: ${(size / 1024 / 1024).toFixed(2)} MB`);
+    result({ path: archive, size });
   },
 
   async upload([clipboardId, ...rest]) {
@@ -410,7 +419,7 @@ const commands = {
     if (!output && fs.existsSync(target)) {
       const ext = path.extname(target);
       target = `${target.slice(0, target.length - ext.length)}_${stamp()}${ext}`;
-      console.log('Exists already, saving alongside it instead.');
+      say('Exists already, saving alongside it instead.');
     }
     // Streamed to disk: files can be several GB.
     const hash = createHash('sha256');
@@ -474,9 +483,19 @@ const commands = {
     if (!id) die('usage: shares <clipboard_id|file_id>');
     requireToken('Listing shares');
     const type = await targetType(id);
-    const list = await call('GET', `/api/v2/shares?target_type=${type}&target_id=${id}`);
+    const list = (await call('GET', `/api/v2/shares?target_type=${type}&target_id=${id}`)).map(s => ({ ...s, target_type: type, target_id: id }));
+    if (type === 'clipboard') {
+      // upload --share links each file, so a clipboard's files count as its shares too.
+      const clipboard = await call('GET', `/api/v2/clipboards/${id}`);
+      for (const f of clipboard.files || []) {
+        for (const s of await call('GET', `/api/v2/shares?target_type=file&target_id=${f.unique_id}`)) {
+          list.push({ ...s, target_type: 'file', target_id: f.unique_id, filename: f.filename });
+        }
+      }
+    }
     for (const s of list) {
-      say(`${s.id}  ${shareUrl(s.token)}  ${s.active ? 'active' : 'inactive'}  expires ${s.expires_at || 'never'}${s.has_password ? '  password' : ''}  opened ${s.view_count}x`);
+      const what = s.target_type === 'file' && s.filename ? `  file ${s.filename}` : `  ${s.target_type}`;
+      say(`${s.id}  ${shareUrl(s.token)}${what}  ${s.active ? 'active' : 'inactive'}  expires ${s.expires_at || 'never'}${s.has_password ? '  password' : ''}  opened ${s.view_count}x`);
     }
     if (!list.length) say('no share links');
     result(list);
@@ -497,17 +516,27 @@ const commands = {
 
   async 'delete-file'([fileId]) {
     if (!fileId) die('file_id is required');
-    show(await call('DELETE', `/api/files/${fileId}`));
+    await call('DELETE', `/api/files/${fileId}`);
+    say(`Deleted file ${fileId}`);
+    result({ deleted: fileId, type: 'file' });
+  },
+
+  async 'delete-clipboard'([clipboardId]) {
+    if (!clipboardId) die('clipboard_id is required');
+    await call('DELETE', `/api/v2/clipboards/${clipboardId}`);
+    say(`Deleted clipboard ${clipboardId} with its text and files`);
+    result({ deleted: clipboardId, type: 'clipboard' });
   },
 
   async sites() {
     requireToken('Listing sites');
     const list = await call('GET', '/api/v2/sites');
-    if (!list.sites.length) return console.log('no sites yet');
+    if (!list.sites.length) say('no sites yet');
     for (const site of list.sites) {
       const flags = [site.has_password && 'password', site.disabled && 'disabled', site.blocked && 'blocked'].filter(Boolean);
-      console.log(`${site.slug}  ${site.url}  v${site.version}  ${site.name || ''}${flags.length ? `  [${flags.join(', ')}]` : ''}`);
+      say(`${site.slug}  ${site.url}  v${site.version}  ${site.name || ''}${flags.length ? `  [${flags.join(', ')}]` : ''}`);
     }
+    result(list.sites);
   },
 
   async publish([source, ...rest]) {
@@ -533,7 +562,8 @@ const commands = {
     requireToken('Deleting a site');
     if (!slug) die('slug is required');
     await call('DELETE', `/api/v2/sites/${slug}`);
-    console.log(`Deleted site ${slug}`);
+    say(`Deleted site ${slug}`);
+    result({ deleted: slug, type: 'site' });
   },
 
   async help() {

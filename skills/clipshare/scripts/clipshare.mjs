@@ -40,6 +40,7 @@ const TOKEN_SOURCE = process.env.CLIPSHARE_TOKEN ? 'CLIPSHARE_TOKEN' : config.to
 const KEEP = ['1h', '1d', '7d', '30d', 'forever'];
 const EXPIRE_HOURS = { '1h': 1, '1d': 24, '7d': 168, '30d': 720, never: null };
 const JSON_OUT = process.argv.includes('--json');
+const CHANNELS_FILE = path.join(os.homedir(), '.config', 'clipshare', 'channels.json');
 
 const die = message => {
   console.error(`ERROR: ${message}`);
@@ -72,6 +73,15 @@ Usage:
   clipshare.mjs publish <dir|site.zip> [--slug name] [--name title] [--spa] [--password pw]
   clipshare.mjs update-site <slug> <dir|site.zip>
   clipshare.mjs delete-site <slug>
+
+Channels (real-time messages between two agents; both must be online to connect):
+  clipshare.mjs channel open [--as name] [--buffer hours]    (needs a token; prints an invite link)
+  clipshare.mjs channel join <invite_url> [--as name]        (no token needed)
+  clipshare.mjs channel listen <channel> [--once] [--timeout s]
+  clipshare.mjs channel send <channel> <text...> [--file path] [--reply-to id] [--human]
+  clipshare.mjs channel info|close|ws <channel>
+  clipshare.mjs channel list
+  <channel> is the id that open/join print; keys are kept in ${CHANNELS_FILE}
 
 Add --json to any command for JSON output.
 
@@ -157,6 +167,57 @@ async function createShare(type, id, expire, password) {
   return { id: share.id, url: shareUrl(share.token, password), expires_at: share.expires_at };
 }
 
+
+// Channel keys by channel id, so commands take the short id. Readable only by the user: a key
+// is the credential for its side of the channel.
+const readChannels = () => {
+  try {
+    return JSON.parse(fs.readFileSync(CHANNELS_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+};
+
+// { <channel id>: { <my name>: {key, peer, url} } }: both sides may run on one machine.
+function saveChannel(state, key) {
+  const all = readChannels();
+  all[state.channel] = { ...all[state.channel], [state.me]: { key, peer: state.peer, url: BASE } };
+  fs.mkdirSync(path.dirname(CHANNELS_FILE), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(CHANNELS_FILE, JSON.stringify(all, null, 2) + '\n', { mode: 0o600 });
+  fs.chmodSync(CHANNELS_FILE, 0o600);
+}
+
+function channelKey(ref, as) {
+  if (!ref) die('channel id is required (see "channel list")');
+  if (ref.startsWith('ch_')) return ref;
+  const sides = readChannels()[ref] || die(`unknown channel ${ref}: not opened or joined on this machine`);
+  if (as) return sides[as]?.key || die(`${as} is not in channel ${ref} on this machine`);
+  const names = Object.keys(sides);
+  if (names.length > 1) die(`both sides of channel ${ref} are on this machine: add --as ${names.join(' or --as ')}`);
+  return sides[names[0]].key;
+}
+
+const channelRoute = (key, rest = '') => `/api/v2/channels/${encodeURIComponent(key)}${rest}`;
+const wsUrl = key => `${BASE.replace(/^http/, 'ws')}${channelRoute(key, '/ws')}`;
+
+// One line per event, so a watcher (Claude Code's Monitor) gets one notification per message.
+function showEvent(event) {
+  if (JSON_OUT) return console.log(JSON.stringify(event));
+  if (event.type === 'state') {
+    const peer = event.peer ? `${event.peer} ${event.peer_online ? 'online' : 'offline'}` : 'waiting for the other side';
+    return console.log(`[${event.channel}] ${event.state}: ${peer}${event.paused ? ' (paused: a person must write next)' : ''}`);
+  }
+  const head = `[${event.channel} #${event.id} from ${event.from}${event.reply_to ? ` re #${event.reply_to}` : ''}]`;
+  const lines = [];
+  if (event.text) lines.push(event.text.replace(/\n/g, '\n    '));
+  if (event.file) {
+    const f = event.file;
+    lines.push(`file ${f.name} (${f.size} bytes, sha256 ${f.sha256}): node ${process.argv[1]} download '${f.url}'`);
+  }
+  console.log(`${head} ${lines.join(' | ')}`);
+}
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 const requireToken = what =>
   TOKEN || die(`${what} needs an API token. Ask the user to create one under 账号设置 → API 令牌 at ${BASE}/settings and run "node <this script> login" in their own terminal.`);
@@ -564,6 +625,127 @@ const commands = {
     await call('DELETE', `/api/v2/sites/${slug}`);
     say(`Deleted site ${slug}`);
     result({ deleted: slug, type: 'site' });
+  },
+
+  async channel([sub, ...rest]) {
+    const opts = { text: [] };
+    for (let i = 0; i < rest.length; i++) {
+      const a = rest[i];
+      if (a === '--as') opts.as = rest[++i];
+      else if (a === '--buffer') opts.buffer = Number(rest[++i]);
+      else if (a === '--file') opts.file = rest[++i];
+      else if (a === '--reply-to') opts.replyTo = Number(rest[++i]);
+      else if (a === '--timeout') opts.timeout = Number(rest[++i]);
+      else if (a === '--human') opts.human = true;
+      else if (a === '--once') opts.once = true;
+      else if (opts.ref === undefined) opts.ref = a;
+      else opts.text.push(a);
+    }
+    const name = opts.as || process.env.CLIPSHARE_AGENT || os.hostname().split('.')[0];
+
+    if (sub === 'open') {
+      requireToken('Opening a channel');
+      const body = { as: name, ...(opts.buffer ? { buffer_hours: opts.buffer } : {}) };
+      const state = await call('POST', '/api/v2/channels', { json: body });
+      saveChannel(state, state.key);
+      say(`Channel: ${state.channel} (you are ${state.me})`);
+      say(`Invite: ${state.invite_url}`);
+      say(`The other side joins with: node clipshare.mjs channel join '${state.invite_url}' --as <name>`);
+      say(`Stay online until it joins: node ${process.argv[1]} channel listen ${state.channel}`);
+      say(`(Claude Code: Monitor({ws: {url: "${wsUrl(state.key)}"}}) instead of listen)`);
+      return result({ ...state, ws_url: wsUrl(state.key) });
+    }
+    if (sub === 'join') {
+      if (!opts.ref) die('usage: channel join <invite_url> [--as name]');
+      const state = await call('POST', '/api/v2/channels/join', { json: { invite: opts.ref, as: name } });
+      saveChannel(state, state.key);
+      say(`Channel: ${state.channel}, connected to ${state.peer} (you are ${state.me})`);
+      say(`Listen: node ${process.argv[1]} channel listen ${state.channel}`);
+      return result({ ...state, ws_url: wsUrl(state.key) });
+    }
+    if (sub === 'list') {
+      const rows = Object.entries(readChannels()).flatMap(([id, sides]) =>
+        Object.entries(sides).map(([me, c]) => ({ id, me, peer: c.peer, url: c.url })),
+      );
+      if (JSON_OUT) return result(rows);
+      for (const r of rows) console.log(`${r.id}\t${r.me} <-> ${r.peer || '?'}\t${r.url}`);
+      return;
+    }
+
+    const key = channelKey(opts.ref, opts.as);
+    if (sub === 'info') return showEvent(await call('GET', channelRoute(key)));
+    if (sub === 'ws') return console.log(wsUrl(key));
+    if (sub === 'close') {
+      const state = await call('DELETE', channelRoute(key));
+      say(`Closed channel ${state.channel}`);
+      return result(state);
+    }
+    if (sub === 'send') {
+      const text = opts.text.join(' ');
+      let message;
+      if (opts.file) {
+        if (!fs.existsSync(opts.file)) die(`file not found: ${opts.file}`);
+        const form = new FormData();
+        form.append('file', await openAsBlob(opts.file), path.basename(opts.file));
+        form.append('text', text);
+        if (opts.replyTo) form.append('reply_to', String(opts.replyTo));
+        if (opts.human) form.append('human', 'true');
+        message = await call('POST', channelRoute(key, '/messages'), { body: form });
+      } else {
+        if (!text) die('usage: channel send <channel> <text...> [--file path]');
+        const json = { text, reply_to: opts.replyTo || null, human: !!opts.human };
+        message = await call('POST', channelRoute(key, '/messages'), { json });
+      }
+      say(`Sent #${message.id}${message.delivered ? '' : ' (the other side is offline: it gets the message when it reconnects)'}`);
+      return result(message);
+    }
+    if (sub === 'listen') {
+      // Long-poll. Without a cursor the server resumes after the last message this side
+      // confirmed; each request confirms what the previous one returned.
+      const deadline = opts.timeout ? Date.now() + opts.timeout * 1000 : Infinity;
+      let cursor = null;
+      let lastState = '';
+      let failures = 0;
+      let first = true;
+      while (Date.now() < deadline) {
+        const wait = Math.max(1, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
+        const query = `?wait=${wait}${cursor === null ? '' : `&after=${cursor}`}`;
+        let response;
+        try {
+          response = await fetch(`${BASE}${channelRoute(key, '/messages')}${query}`);
+        } catch (err) {
+          // Stay on: the server keeps the messages until we are back.
+          console.error(`connection failed (${err.message}), retrying`);
+          await sleep(Math.min(30000, 1000 * 2 ** failures++));
+          continue;
+        }
+        if (response.status >= 500) {
+          await sleep(Math.min(30000, 1000 * 2 ** failures++));
+          continue;
+        }
+        if (!response.ok) die(`listen -> ${response.status}\n${(await response.text()).slice(0, 500)}`);
+        failures = 0;
+        const batch = await response.json();
+        const state = JSON.stringify([batch.state.state, batch.state.peer, batch.state.paused]);
+        const changed = state !== lastState;
+        if (changed) {
+          lastState = state;
+          showEvent(batch.state);
+        }
+        batch.messages.forEach(showEvent);
+        cursor = batch.cursor;
+        if (batch.state.state === 'closed') break;
+        // --once: back to the agent at the first message, or when the other side joins or leaves.
+        if (opts.once && (batch.messages.length || (changed && !first))) break;
+        first = false;
+      }
+      if (cursor !== null) {
+        // Confirm the last batch before exiting, so the next listen does not repeat it.
+        await fetch(`${BASE}${channelRoute(key, '/messages')}?after=${cursor}`).catch(() => {});
+      }
+      return;
+    }
+    die(`unknown channel command: ${sub || '(none)'}; see help`);
   },
 
   async help() {

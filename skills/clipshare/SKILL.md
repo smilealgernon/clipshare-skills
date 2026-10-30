@@ -1,6 +1,6 @@
 ---
 name: clipshare
-description: Move files and text between machines that share no filesystem through ClipShare (https://q3.1o24.com by default) — a build artifact, an installer, a log, a stack trace — over its MCP server (/mcp), a Node helper, or plain curl, with optional API-token login for private clipboards, share links that curl can fetch, and files kept longer than an hour. Use when the user gives a ClipShare link or clipboard id, asks to send something to another machine or agent ("传给我", "发个链接", "传到服务器上"), or asks to set up the ClipShare MCP.
+description: Move files and text between machines that share no filesystem through ClipShare (https://q3.1o24.com by default) — a build artifact, an installer, a log, a stack trace — over its MCP server (/mcp), a Node helper, or plain curl, with optional sign-in (the user only opens a link and clicks 允许) for private clipboards, share links that curl can fetch, and files kept longer than an hour. Use when the user gives a ClipShare link or clipboard id, asks to send something to another machine or agent ("传给我", "发个链接", "传到服务器上", "把这张图片传到我的剪贴板"), or asks to set up the ClipShare MCP.
 ---
 
 # ClipShare
@@ -16,16 +16,28 @@ deployment (replace the host in the examples).
   clipboard owned by an account: 1 day by default, and the owner can change a
   file to `1h`, `1d`, `7d`, `30d` or `forever`. Text entries do not expire.
   Upload right before the far side fetches, or use a token and `--keep`.
-- **Accounts and API tokens.** The user registers on the site and creates a
-  token under 账号设置 → API 令牌 (`cs_...`). Send it as
-  `Authorization: Bearer cs_...`. With it, new clipboards belong to that
-  account and can be **private** (only the token's account can read them).
-  A wrong token is an error, never a silent fall back to anonymous.
+- **Accounts.** An agent signs in for the user by **device sign-in** (see
+  Signing in): the user opens a link and clicks 允许, and the agent gets an
+  API token (`cs_...`), sent as `Authorization: Bearer cs_...`. With it, new
+  clipboards belong to that account and can be **private** (only that account
+  can read them). A wrong token is an error, never a silent fall back to
+  anonymous.
+- **Once a clipboard has an owner, only the owner can write to it.** If the
+  user claims (认领) a clipboard you created anonymously, your next write gets
+  403: sign in as the user (device sign-in), then write again. When the user
+  will want the clipboard private or kept, sign in **before** creating it.
 - **Previews** of files come from a separate origin. Use `/api/files/<id>`
   for downloads, not preview links.
-- Uploads up to 10 GB.
+- Uploads up to 10 GB (as base64 JSON: 20 MB).
+- Every upload answer has `expires_at`. Tell the user when an anonymous file
+  goes ("1 小时后自动删除"), so it is no surprise.
 
 Do not write a token into a repository file.
+
+## Talking to the user
+
+Plain words. Do not make the user handle tokens, headers, curl or form
+uploads. The only thing you ever ask the user to do is "打开这个链接，点允许".
 
 ## Work without asking
 
@@ -39,26 +51,25 @@ way: print the exact command for the user to run as `! <command>`, and tell
 them that adding `Bash(node <helper path>:*)` to `permissions.allow` in
 `~/.claude/settings.json` stops the prompts for good.
 
-## Right after installing: the API token
+## Signing in (device sign-in)
 
-Without a token everything works anonymously: files go after 1 hour, nothing
-is private, and sites cannot be published. When the skill has just been
-installed, or the user wants private clipboards, longer-lived files or a site,
-run `node $H whoami` (see Helper script for `$H`). If it says `anonymous`,
-tell the user, in their language:
+Without an account everything works anonymously: files go after 1 hour,
+nothing is private, sites cannot be published. When the user wants private
+clipboards, longer-lived files or a site, or a write gets 403 on a clipboard
+they own, sign in. Run `node $H whoami` first (see Helper script for `$H`);
+if it says `anonymous`:
 
-1. Open `https://q3.1o24.com/settings` (log in or register first), find
-   「API 令牌」, type a name such as the machine's name, click 生成, and copy
-   the `cs_...` token.
-2. Run the login command with the token, for example in Claude Code:
-   `! node ~/.agents/skills/clipshare/scripts/clipshare.mjs login cs_...`
-   (print it with the real helper path). Or just paste the token in the chat
-   and you run `node $H login <token>`. It is checked against the server and
-   saved to `~/.config/clipshare/config.json`.
+1. `node $H login` prints a link (`.../device?code=XXXX-XXXX`) and returns.
+2. Tell the user: "打开这个链接，点「允许」：<link>". If they are not signed in
+   on the site, the page asks them to sign in (or register) first.
+3. Run `node $H login` again. It waits about 100 seconds for the approval and
+   saves the token to `~/.config/clipshare/config.json`. If it says "Not
+   approved yet", run it again; the link stays valid for 15 minutes.
 
-Then run `node $H whoami` to confirm. `login` with no argument asks for the
-token at a hidden prompt (for a terminal of their own); `CLIPSHARE_TOKEN` in
-the shell profile works too; `node $H logout` removes the saved token.
+Do not send the user to the settings page to copy a token. The token shows up
+there as 「设备授权：…」, where the user can revoke it. If the user already has
+a token, `node $H login cs_...` (or `login -` to read it from stdin) saves it;
+`CLIPSHARE_TOKEN` in the environment works too; `node $H logout` removes it.
 
 ## MCP
 
@@ -70,8 +81,9 @@ Tools: `create_clipboard`, `get_clipboard_info`, `update_clipboard`,
 `add_clipboard_entry`, `list_clipboard_entries`, `get_entry`, `get_entry_info`,
 `update_entry`, `delete_entry`, `list_clipboard_files`, `get_file_info`,
 `get_file_download_url`, `delete_file`, `create_share_link` (a link for a
-machine without a token, see below). There is **no upload tool**: files go up
-over HTTP (helper or curl below); MCP then lists them and gives download URLs.
+machine without a token, see below), `upload_file` (`filename` and
+`content_base64`, up to 20 MB; larger files go up over HTTP with the helper or
+curl below).
 
 ```bash
 # Claude Code (user scope = every project)
@@ -121,7 +133,8 @@ node $H keep FILE_ID forever                    # owner only (needs the token)
 node $H delete-file FILE_ID
 node $H delete-clipboard CLIPBOARD_ID           # with its text and files
 node $H pack ./logs /tmp/logs.tar.gz            # directories must be packed first
-node $H login [cs_...]
+node $H login                                   # device sign-in: link for the user, then run again
+node $H login cs_...                            # a token the user already has
 node $H logout
 ```
 
@@ -139,6 +152,31 @@ Without an output path it uses the original name and never overwrites.
 anonymous files always live 1 hour.
 
 Write archives to a scratch directory, never into a worktree.
+
+## Only an HTTP client, no shell
+
+Everything works with plain HTTP and JSON (`$S` is the server):
+
+1. **Sign in** (optional; skip it for an anonymous clipboard):
+   - `POST $S/api/v2/device/code` with `{"client": "<what you are>"}` returns
+     `device_code`, `user_code`, `verification_uri_complete`, `interval`,
+     `expires_in`. Give the user `verification_uri_complete` to open and allow.
+   - `POST $S/api/v2/device/token` with `{"device_code": "..."}`, at most once
+     per `interval` seconds. HTTP 400 with `error` `authorization_pending`: not
+     yet; `slow_down`: wait longer; `access_denied` or `expired_token`: stop
+     and start over. HTTP 200 returns `{"token": "cs_..."}`. Send it as
+     `Authorization: Bearer cs_...` from then on.
+2. **Clipboard:** `POST $S/api/v2/clipboards` with `{"name": "...",
+   "visibility": "private"}` (signed in) or `{"name": "..."}`. The answer has
+   `unique_id`.
+3. **Upload:** `POST $S/api/clipboards/<id>/files` with JSON
+   `{"filename": "photo.png", "content_base64": "..."}` (up to 20 MB). The
+   bytes must be the file's exact bytes, base64-encoded; never pass a binary
+   file through as a text string, it gets corrupted. Larger files: form upload
+   with field `file`, again with the raw bytes. The answer has `unique_id`,
+   `file_size` and `expires_at`; check `file_size`.
+4. **Download:** `GET $S/api/files/<file id>`; the `X-Content-SHA256` header
+   lets you check the bytes.
 
 ## To a machine without a token (a server)
 

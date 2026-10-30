@@ -11,8 +11,9 @@
  *                  clipboards belong to that account: files live 1 day instead of 1 hour, can be
  *                  kept longer, and the clipboard can be private. Sites need it.
  *
- * Instead of the environment, `clipshare.mjs login [token]` stores the token in
- * ~/.config/clipshare/config.json, readable only by the user.
+ * Instead of the environment, `clipshare.mjs login` stores a token in ~/.config/clipshare/config.json,
+ * readable only by the user: device sign-in (the user opens a link and clicks 允许), or
+ * `login cs_...` with a token the user already has.
  *
  * --json (anywhere on the command line) prints one JSON document instead of text.
  */
@@ -52,7 +53,9 @@ const usage = () => {
 
 Usage:
   clipshare.mjs whoami
-  clipshare.mjs login [token]               (no token: asks for it, hidden)
+  clipshare.mjs login [--wait s]            (device sign-in: prints a link for the user to approve;
+                                            run it again to wait for the approval)
+  clipshare.mjs login cs_... | login -      (a token from the user, given or piped in)
   clipshare.mjs logout
   clipshare.mjs create [name] [--private]
   clipshare.mjs add-text <clipboard_id> <text>
@@ -217,39 +220,73 @@ function showEvent(event) {
   console.log(`${head} ${lines.join(' | ')}`);
 }
 
+const PENDING_FILE = path.join(os.homedir(), '.config', 'clipshare', 'device-login.json');
+
+function writePrivate(file, data) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+}
+
+async function saveToken(token) {
+  if (!token.startsWith('cs_')) die('that does not look like a ClipShare token (cs_...)');
+  const response = await fetch(`${BASE}/api/v2/me`, { headers: { Authorization: `Bearer ${token}` } });
+  if (!response.ok) die(`the server did not accept this token (${response.status})`);
+  const me = await response.json();
+  writePrivate(CONFIG_FILE, { url: BASE, token });
+  say(`Logged in as ${me.user.email}. Token saved to ${CONFIG_FILE} (only you can read it).`);
+  result({ logged_in: true, email: me.user.email });
+}
+
+// Device sign-in (RFC 8628). Agents see a command's output only when it ends, so the first run
+// prints the link and returns; the next run waits for the approval. In a terminal one run does both.
+async function deviceLogin(waitSeconds) {
+  let pending = null;
+  try {
+    pending = JSON.parse(fs.readFileSync(PENDING_FILE, 'utf8'));
+  } catch {}
+  if (!pending || pending.url !== BASE || pending.expires_at <= Date.now()) {
+    const client = `${process.env.CLIPSHARE_AGENT || 'ClipShare helper'} on ${os.hostname()}`;
+    const started = await call('POST', '/api/v2/device/code', { json: { client } });
+    pending = { ...started, url: BASE, expires_at: Date.now() + started.expires_in * 1000 };
+    writePrivate(PENDING_FILE, pending);
+    say(`Ask the user to open this link and click 允许 (allow):\n${pending.verification_uri_complete}`);
+    say(`Code shown on the page: ${pending.user_code} (valid ${Math.round(started.expires_in / 60)} minutes)`);
+    if (!process.stdout.isTTY) {
+      say('Then run login again to finish.');
+      return result({ logged_in: false, url: pending.verification_uri_complete, user_code: pending.user_code });
+    }
+  }
+  let interval = Math.max(pending.interval || 5, 1);
+  const deadline = Date.now() + waitSeconds * 1000;
+  for (;;) {
+    const response = await fetch(`${BASE}/api/v2/device/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device_code: pending.device_code }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (response.ok && body.token) {
+      fs.rmSync(PENDING_FILE, { force: true });
+      return saveToken(body.token);
+    }
+    if (body.error === 'slow_down') interval += 5;
+    else if (body.error !== 'authorization_pending') {
+      fs.rmSync(PENDING_FILE, { force: true });
+      die(body.message || `${response.status} ${JSON.stringify(body)}`);
+    }
+    if (Date.now() + interval * 1000 > deadline) {
+      say(`Not approved yet. The link is still ${pending.verification_uri_complete} — run login again to keep waiting.`);
+      return result({ logged_in: false, url: pending.verification_uri_complete, user_code: pending.user_code });
+    }
+    await sleep(interval * 1000);
+  }
+}
+
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 const requireToken = what =>
-  TOKEN || die(`${what} needs an API token. Ask the user to create one under 账号设置 → API 令牌 at ${BASE}/settings and run "node <this script> login" in their own terminal.`);
-
-// Read one line from the terminal without echoing it.
-function readHidden(prompt) {
-  return new Promise((resolve, reject) => {
-    const input = process.stdin;
-    if (!input.isTTY) return reject(new Error('not a terminal'));
-    process.stdout.write(prompt);
-    input.setRawMode(true);
-    input.resume();
-    input.setEncoding('utf8');
-    let value = '';
-    const done = result => {
-      input.setRawMode(false);
-      input.pause();
-      input.removeListener('data', onData);
-      process.stdout.write('\n');
-      result instanceof Error ? reject(result) : resolve(result);
-    };
-    const onData = chunk => {
-      for (const ch of chunk) {
-        if (ch === '\r' || ch === '\n') return done(value.trim());
-        if (ch === '\u0003') return done(new Error('cancelled'));
-        if (ch === '\u007f' || ch === '\b') value = value.slice(0, -1);
-        else value += ch;
-      }
-    };
-    input.on('data', onData);
-  });
-}
+  TOKEN || die(`${what} needs the user's account. Run "node ${process.argv[1]} login": it prints a link for the user to open and approve.`);
 
 // Files of a site directory, as [relative posix path, absolute path]; skips VCS and dependencies.
 function siteFiles(dir) {
@@ -307,25 +344,14 @@ const commands = {
     result({ anonymous: false, email: me?.user?.email, token_source: TOKEN_SOURCE, storage: storage || null });
   },
 
-  async login([given]) {
-    let token = given?.trim();
-    if (!token && !process.stdin.isTTY) token = fs.readFileSync(0, 'utf8').trim();
-    if (!token) {
-      try {
-        console.log(`Create a token at ${BASE}/settings (账号设置 → API 令牌), then paste it here.`);
-        token = await readHidden('API token (input hidden): ');
-      } catch (err) {
-        die(err.message === 'cancelled' ? 'cancelled' : 'no token: pass it as "login cs_..." or pipe it in');
-      }
-    }
-    if (!token.startsWith('cs_')) die('that does not look like a ClipShare token (cs_...)');
-    const response = await fetch(`${BASE}/api/v2/me`, { headers: { Authorization: `Bearer ${token}` } });
-    if (!response.ok) die(`the server did not accept this token (${response.status})`);
-    const me = await response.json();
-    fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ url: BASE, token }, null, 2) + '\n', { mode: 0o600 });
-    fs.chmodSync(CONFIG_FILE, 0o600);
-    console.log(`Logged in as ${me.user.email}. Token saved to ${CONFIG_FILE} (only you can read it).`);
+  async login(args) {
+    let token = args.find(a => a.startsWith('cs_'));
+    if (args.includes('-')) token = fs.readFileSync(0, 'utf8').trim();
+    if (token !== undefined) return saveToken(token);
+    const waitAt = args.indexOf('--wait');
+    // Below the 2-minute command timeout most agents run with.
+    const wait = waitAt >= 0 ? Number(args[waitAt + 1]) : 100;
+    await deviceLogin(Number.isFinite(wait) ? wait : 100);
   },
 
   async logout() {
@@ -423,6 +449,10 @@ const commands = {
       say(`SHA256: ${sha256}`);
       say(`Download URL: ${item.download_url}`);
       if (keep) item.expires_at = await setKeep(id, keep);
+      else {
+        item.expires_at = payload.expires_at ?? null;
+        say(`Expires: ${item.expires_at || 'never'}`);
+      }
       if (share) {
         item.share = await createShare('file', id, share);
         say(`Share URL: ${item.share.url}  (no token needed, ${share === 'never' ? 'no expiry' : `expires in ${share}`})`);

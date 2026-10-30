@@ -207,10 +207,16 @@ const wsUrl = key => `${BASE.replace(/^http/, 'ws')}${channelRoute(key, '/ws')}`
 function showEvent(event) {
   if (JSON_OUT) return console.log(JSON.stringify(event));
   if (event.type === 'state') {
-    const peer = event.peer ? `${event.peer} ${event.peer_online ? 'online' : 'offline'}` : 'waiting for the other side';
+    // peer_joined is false while a side of a channel created in the browser has not joined yet.
+    const peer = !event.peer
+      ? 'waiting for the other side'
+      : event.peer_joined === false
+        ? `waiting for ${event.peer} to join`
+        : `${event.peer} ${event.peer_online ? 'online' : 'offline'}`;
     return console.log(`[${event.channel}] ${event.state}: ${peer}${event.paused ? ' (paused: a person must write next)' : ''}`);
   }
-  const head = `[${event.channel} #${event.id} from ${event.from}${event.reply_to ? ` re #${event.reply_to}` : ''}]`;
+  const sender = `${event.from}${event.by_creator ? ' (the person who created the channel)' : ''}`;
+  const head = `[${event.channel} #${event.id} from ${sender}${event.reply_to ? ` re #${event.reply_to}` : ''}]`;
   const lines = [];
   if (event.text) lines.push(event.text.replace(/\n/g, '\n    '));
   if (event.file) {
@@ -689,8 +695,10 @@ const commands = {
       if (!opts.ref) die('usage: channel join <invite_url> [--as name]');
       const state = await call('POST', '/api/v2/channels/join', { json: { invite: opts.ref, as: name } });
       saveChannel(state, state.key);
-      say(`Channel: ${state.channel}, connected to ${state.peer} (you are ${state.me})`);
-      say(`Listen: node ${process.argv[1]} channel listen ${state.channel}`);
+      if (state.peer_joined === false) say(`Channel: ${state.channel} (you are ${state.me}), waiting for ${state.peer} to join`);
+      else say(`Channel: ${state.channel}, connected to ${state.peer} (you are ${state.me})`);
+      say(`Listen: node ${process.argv[1]} channel listen ${state.channel} --as ${state.me}`);
+      say(`(Claude Code: Monitor({ws: {url: "${wsUrl(state.key)}"}}) instead of listen)`);
       return result({ ...state, ws_url: wsUrl(state.key) });
     }
     if (sub === 'list') {
